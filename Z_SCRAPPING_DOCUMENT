@@ -1,0 +1,205 @@
+*"-------------------------------------------------------------------------
+* DD-Reference: ZDDE-00102617                                              *
+* FS-Reference: ZFSE-00102616                                              *
+* Description - To fetch the item details                                *
+*--------------------------------------------------------------------------*
+* Change Log:                                                              *
+*                                                                          *
+* Who           Date            CR           Text                          *
+* AMIREHA1        12-DEC-2025     1100277483   Initial version             *
+*--------------------------------------------------------------------------*
+  METHOD get_item_data.
+
+    TYPES: BEGIN OF ty_item_data,
+             matnr                TYPE matnr,
+             posnr                TYPE posnr,
+             un_number            TYPE char40,
+             proper_shipping_name TYPE atwrt,
+           END OF ty_item_data.
+
+
+    CONSTANTS: lc_klart          TYPE klassenart VALUE '001',
+               lc_atnam          TYPE atnam VALUE 'Z0CX_MAT_HSE_NET',
+               lc_scenario       TYPE bapistdtyp-scenario VALUE '00',
+               lc_unnumber01_04  TYPE atnam VALUE 'ZX0G_UNNUMBER01-04',
+               lc_propershipname TYPE atnam VALUE 'ZX0G_PROPERSHIPNAME'.
+
+
+    DATA: lv_group       TYPE                 eserecn,
+          lt_subheader   TYPE TABLE OF  bapi1077rh,
+          lt_return      TYPE TABLE OF        bapiret2,
+          lt_prop_data   TYPE TABLE OF        bapi1077pr,
+          lt_prop_header TYPE TABLE OF        bapi1077vh,
+          lt_prop        TYPE SORTED TABLE OF bapi1077pr WITH NON-UNIQUE KEY name_char,
+          lt_prop_temp   TYPE SORTED TABLE OF bapi1077pr WITH NON-UNIQUE KEY primary_key COMPONENTS name_char
+                                                         WITH NON-UNIQUE SORTED KEY key1 COMPONENTS obj_key
+                                                         WITH NON-UNIQUE SORTED KEY key2 COMPONENTS ref_recnph name_char,
+          lr_phrid       TYPE RANGE OF        esephrid,
+          lt_items_basic TYPE zops_scrapping_doc_item_tt,
+          lt_item_data   TYPE STANDARD TABLE OF ty_item_data.
+
+
+    lt_items_basic = ct_items.
+    DELETE ADJACENT DUPLICATES FROM lt_items_basic.
+
+    IF lt_items_basic IS NOT INITIAL.
+      SELECT
+      e1~matnr,
+      e1~recnroot,
+      e2~subid,
+      e3~posnr,
+      e3~werks
+      FROM estmj AS e1
+      INNER JOIN estrh AS e2
+      ON e2~recn = e1~recnroot
+      INNER JOIN @lt_items_basic AS e3
+      ON e1~matnr = e3~matnr
+      WHERE e1~delflg <> @abap_true
+      INTO TABLE @DATA(lt_mat_rec).
+    ENDIF.
+
+    IF lt_mat_rec IS NOT INITIAL.
+      lt_subheader = VALUE #(
+      FOR ls_row IN lt_mat_rec
+      ( substance = ls_row-subid )
+      ).
+    ENDIF.
+    CALL FUNCTION 'BAPI_BUS1077_GETDETAIL'
+      EXPORTING
+        scenario      = lc_scenario
+        flg_prop_data = abap_true
+      TABLES
+        return        = lt_return
+        sub_header    = lt_subheader
+        prop_data     = lt_prop_data
+        prop_header   = lt_prop_header.
+
+
+    IF lt_prop_data[] IS NOT INITIAL.
+      lt_prop_temp = lt_prop_data.
+      lr_phrid = VALUE #( FOR ls_phrid IN lt_prop_temp
+                                   LET s = if_fsbp_const_range=>sign_include
+                                       o = if_fsbp_const_range=>option_equal
+                                    IN sign  = s
+                                      option = o
+                                     ( low = ls_phrid-char_value+5(25) ) ).
+      SELECT e1~phrid,
+            e1~recn,
+            e2~recnroot,
+            e2~phrcode
+             FROM estph AS e1
+       INNER JOIN estpp AS e2
+               ON e1~recn EQ e2~recnroot
+       INTO TABLE @DATA(lt_recnroot)
+            WHERE phrid IN @lr_phrid.
+
+      SELECT dg_reg, trmodcod
+        FROM ztm_dg_regulate
+        INTO TABLE @DATA(lt_dg_reg).
+
+      SORT lt_dg_reg BY dg_reg.
+      LOOP AT lt_recnroot ASSIGNING FIELD-SYMBOL(<ls_rec>).
+        ASSIGN lt_dg_reg[ dg_reg = <ls_rec>-phrcode ] TO FIELD-SYMBOL(<ls_dg>).
+        IF sy-subrc EQ 0.
+          CLEAR lt_prop_data.
+          lt_prop_data = VALUE #(
+            FOR ls_recnroot IN lt_recnroot
+            FOR ls_objkey IN lt_prop_temp USING KEY key2
+              WHERE ( ref_recnph = ls_recnroot-recnroot )
+            FOR ls_data IN lt_prop_temp USING KEY key1
+              WHERE ( obj_key = ls_objkey-obj_key )
+            ( ls_data ) ).
+          lt_prop = lt_prop_data.
+        ENDIF.
+      ENDLOOP.
+
+*Go to PROP_HEADER and fetch the CHAR_VALUE for all ZX0G_MODEOFTRANS
+*Pass the numeric part of CHAR_VALUE as PHRID to table ESTPH and fetch RECN
+      lr_phrid = VALUE #( FOR ls_phrid1 IN lt_prop_data
+                                       LET s = if_fsbp_const_range=>sign_include
+                                           o = if_fsbp_const_range=>option_equal
+                                        IN sign   = s
+                                           option = o
+                                          ( low = ls_phrid1-char_value+5(25) ) ).
+
+*pass recn as recnroot in estpp and fetch phrcode
+      SELECT e1~phrid,
+             e1~recn,
+             e2~recnroot,
+             e2~phrcode,
+             e2~phrtext
+             FROM estph AS e1
+       INNER JOIN estpp AS e2
+               ON e1~recn EQ e2~recnroot
+       INTO TABLE @DATA(lt_phrcode)
+            WHERE phrid IN @lr_phrid.
+
+
+      IF sy-subrc EQ 0.
+        LOOP AT lt_prop ASSIGNING FIELD-SYMBOL(<lfs_prop_data>)
+                             GROUP BY ( recno_root = <lfs_prop_data>-recno_root )
+                             WITHOUT MEMBERS ASSIGNING FIELD-SYMBOL(<lfs_group>).
+          lv_group = <lfs_group>.
+** UN Number
+          DATA(ls_prop) = VALUE #( lt_prop_data[ name_char = lc_unnumber01_04
+                                                 recno_root = lv_group ] OPTIONAL ).
+          IF ls_prop IS NOT INITIAL.
+            DATA(lv_phrcode) = VALUE #( lt_phrcode[ recnroot = ls_prop-ref_recnph ]-phrcode OPTIONAL ).
+          ENDIF.
+** Proper Shipping Name
+          ls_prop = VALUE #( lt_prop[ name_char = lc_propershipname
+                                      recno_root = lv_group ] OPTIONAL ).
+          IF ls_prop IS NOT INITIAL.
+            DATA(lv_phrtxt) = VALUE #( lt_phrcode[ recnroot = ls_prop-ref_recnph ]-phrcode OPTIONAL ). "
+          ENDIF.
+          INSERT VALUE #(
+          un_number = |{ TEXT-t01 }{ lv_phrcode }|
+          proper_shipping_name = lv_phrtxt
+          matnr = VALUE #( lt_mat_rec[ recnroot =  lv_group ]-matnr OPTIONAL )
+          posnr = VALUE #( lt_mat_rec[ recnroot =  lv_group ]-posnr OPTIONAL )
+          ) INTO TABLE lt_item_data.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+
+    IF lt_items_basic IS NOT INITIAL.
+      SELECT a~objek,
+             a~cuobj,
+             c~atwrt
+        FROM inob AS a
+        INNER JOIN @lt_items_basic AS b
+                ON a~objek = b~matnr
+        INNER JOIN ausp AS c
+                ON c~objek = a~cuobj
+        INNER JOIN cabn AS n
+                ON n~atinn = c~atinn
+        WHERE a~klart = @lc_klart
+          AND n~atnam = @lc_atnam
+        INTO TABLE @DATA(lt_cuobj).
+
+*** Fetch Workflow no
+      SELECT vbeln, a~matnr, a~charg,reqno
+        FROM zav_wfitm AS a
+        INNER JOIN @lt_items_basic AS b
+        ON a~matnr = b~matnr
+        AND a~charg = b~charg
+        AND a~vbeln_vl = b~vbeln
+        INTO TABLE @DATA(lt_reqno).
+
+      SELECT a~zzwastecla,a~matnr
+              FROM marc AS a
+              INNER JOIN @lt_items_basic AS b
+              ON a~matnr = b~matnr
+              WHERE a~werks = b~werks
+              INTO TABLE @DATA(lt_wasteclass).
+      IF sy-subrc EQ 0.
+        LOOP AT ct_items ASSIGNING FIELD-SYMBOL(<lfs_et_items>).
+          <lfs_et_items>-un_number = VALUE #( lt_item_data[ matnr = <lfs_et_items>-matnr posnr = <lfs_et_items>-posnr  ]-un_number OPTIONAL ).
+          <lfs_et_items>-proper_shipping_name = VALUE #( lt_item_data[ matnr = <lfs_et_items>-matnr posnr = <lfs_et_items>-posnr  ]-proper_shipping_name OPTIONAL ).
+          <lfs_et_items>-zzwasteclass = VALUE #( lt_wasteclass[ matnr = <lfs_et_items>-matnr ]-zzwastecla OPTIONAL ).
+          <lfs_et_items>-hse_indicator = VALUE #( lt_cuobj[ objek = <lfs_et_items>-matnr ]-atwrt OPTIONAL ).
+          <lfs_et_items>-lifex = VALUE #( lt_reqno[ vbeln = <lfs_et_items>-vbeln matnr = <lfs_et_items>-matnr charg = <lfs_et_items>-charg ]-reqno OPTIONAL ).
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
